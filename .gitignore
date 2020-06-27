@@ -2,3 +2,6 @@ __pycache__/
 .mypy_cache/
 .env/
 *.pyc
+source/*
+!source/conf.py
+build/
