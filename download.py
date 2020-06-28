@@ -10,10 +10,14 @@ from urllib.error import HTTPError
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 from alive_progress import alive_bar
-from typing import overload, Optional
+from typing import overload, Optional, Any
 
 
 class DownloadError(Exception):
+    pass
+
+
+def noop(*args):
     pass
 
 
@@ -21,6 +25,7 @@ class Item:
     title: str
     path: Path
     url: str
+    children: List[Any]
 
     def __str__(self) -> str:
         return self.title
@@ -52,35 +57,35 @@ class Item:
         else:
             self.html = BeautifulSoup(path.read_text(), "html.parser")
 
+    def write(self) -> None:
+        text = ''
+        if hasattr(self, 'name'):
+            text = f".. _{self.name}:\n\n"
+        text += (
+            f"{self.title}\n{'='*len(self.title)}\n\n"
+            ".. toctree::\n"
+            "   :maxdepth: 1\n\n"
+        )
+        for child in self.children:
+            text += f"   {child.name}/index\n"
+        with open(self.path / "index.rst", "w") as output:
+            output.write(text)
+
 
 class Book(Item):
     title = "The Book of Life"
     url = "https://theschooloflife.com/thebookoflife/"
     path = Path(__file__).parent / "source"
-    parts: List["Part"] = []
+    children: List["Part"] = []
 
     def load(self) -> None:
         super().load()
         for html in self.html(class_="nav-main__sub-rollover"):
             if html.has_attr("onmouseover"):
-                self.parts.append(Part(html.text.strip()))
-
-    def write(self) -> None:
-        index = (
-            f"{self.title}\n{'='*len(self.title)}\n\n"
-            ".. toctree::\n"
-            "   :maxdepth: 2\n"
-            "   :caption: Contents\n\n"
-        )
-        for part in self.parts:
-            index += f"   {part.name}/index\n"
-        with open(self.path / "index.rst", "w") as output:
-            output.write(index)
+                self.children.append(Part(html.text.strip()))
 
 
 class Part(Item):
-    sections: List["Section"] = []
-
     def __init__(self, title: str):
         self.title = title
         self.url = urljoin(Book.url, f"category/{title.lower()}/?index")
@@ -88,52 +93,32 @@ class Part(Item):
 
     def load(self) -> None:
         super().load()
-        self.sections = [
+        self.children = [
             Section(section, self) for section in self.html.find_all("section")
         ]
 
-    def write(self) -> None:
-        index = (
-            f".. _{self.name}:\n\n"
-            f"{self.title}\n{'='*len(self.title)}\n\n"
-            ".. toctree::\n"
-        )
-        for section in self.sections:
-            index += f"   {section.name}/index\n"
-        with open(self.path / "index.rst", "w") as output:
-            output.write(index)
-
 
 class Section(Item):
-    chapters: List["Chapter"] = []
+    download = noop
+    load = noop
 
-    def __init__(self, html: Tag, part: Part):
+    def __init__(self, html: Tag, parent: Part):
         self.title = html.div.text.strip()
-        self.part = part
-        self.path = part.path / self.name
-        self.chapters = [Chapter(chapter, self) for chapter in html.find_all("li")]
-
-    def download(self) -> None:
-        pass
-
-    def load(self) -> None:
-        pass
-
-    def write(self) -> None:
-        index = f".. _{self.name}:\n\n"
-        index += f"{self.title}\n{'='*len(self.title)}\n\n.. toctree::\n"
-        for chapter in self.chapters:
-            index += f"   {chapter.name}/text.rst\n"
-        with open(self.path / "index.rst", "w") as output:
-            output.write(index)
+        self.path = parent.path / self.name
+        self.children: List["Chapter"] = []
+        chapters: List[str] = []
+        for li in html.find_all("li"):
+            chapter = Chapter(li, self)
+            if chapter.name not in chapters:
+                self.children.append(chapter)
+                chapters.append(chapter.name)
 
 
 class Chapter(Item):
-    def __init__(self, html: Tag, section: Section):
+    def __init__(self, html: Tag, parent: Section):
         self.title = html(class_="title")[0].text.strip()
-        self.section = section
         self.url = html.a.attrs["href"]
-        self.path = section.path / self.name
+        self.path = parent.path / self.name
 
     def write(self) -> None:
         if not self.html:
@@ -158,7 +143,7 @@ class Chapter(Item):
         content.append(Content(items[-1], previous, None))
         text = f"{self.title}\n{'='*len(self.title)}\n\n"
         text += "\n".join([c.output() for c in content])
-        with open(self.path / "text.rst", "w") as output:
+        with open(self.path / "index.rst", "w") as output:
             output.write(text)
         del self.html
 
@@ -199,12 +184,12 @@ class Content:
             and len(self.text) < 100
             and not self.is_list
             and not self.is_heading
-            and match(r'^\w', self.text)
+            and match(r'^[a-zA-Z]', self.text)
         )
 
     @property
     def is_list(self) -> bool:
-        if not self.text.startswith("- "):
+        if not self.text.strip().startswith("- "):
             return False
         elif self.previous and self.previous.is_list:
             return True
@@ -223,8 +208,8 @@ class Content:
         return False
 
     def bold(self, tag: str) -> BeautifulSoup:
-        text = sub(f"<{tag}>\\s?", " <<<<<", str(self.content))
-        text = sub(f"\\s?</{tag}>", ">>>>> ", text)
+        text = sub(f"<{tag}>\\s?", " $START$", str(self.content))
+        text = sub(f"\\s?</{tag}>", "$END$ ", text)
         return BeautifulSoup(text, "html.parser")
 
     def output(self) -> str:
@@ -253,8 +238,8 @@ class Content:
             for bold in self.content.find_all(tag):
                 if bold.text:
                     self.content = self.bold(tag)
-            text = sub(r"\s?>>>>>", "**", self.content.text)
-            text = sub(r"<<<<<\s?", "**", text)
+            text = sub(r"\s?\$END\$", "**", self.content.text)
+            text = sub(r"\$START\$\s?", "**", text)
             self._text = text.replace("****", "").strip()
 
         return self.text + "\n"
@@ -301,22 +286,22 @@ if __name__ == "__main__":
     with alive_bar():
         book.load()
 
-    with alive_bar(len(book.parts)) as bar:
-        for part in book.parts:
+    with alive_bar(len(book.children)) as bar:
+        for part in book.children:
             part.load()
             bar(part.title)
 
     chapters = [
         chapter
-        for part in book.parts
-        for section in part.sections
-        for chapter in section.chapters
+        for part in book.children
+        for section in part.children
+        for chapter in section.children
     ]
     with alive_bar(len(chapters)) as bar:
-        for part in book.parts:
-            for section in part.sections:
-                for chapter in section.chapters:
-                    if not (chapter.path / "text.rst").exists():
+        for part in book.children:
+            for section in part.children:
+                for chapter in section.children:
+                    if not (chapter.path / "index.rst").exists():
                         chapter.load()
                         chapter.write()
                     bar(chapter.title)
