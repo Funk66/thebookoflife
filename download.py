@@ -1,5 +1,6 @@
 from re import sub, match
 from time import sleep
+from hashlib import md5
 from shutil import copyfileobj
 from typing import List
 from pathlib import Path
@@ -40,16 +41,16 @@ class Item:
             self.html = None
             return
         self.path.mkdir(parents=True, exist_ok=True)
-        with open(self.path / 'page.html', 'w') as output:
+        with open(self.path / "page.html", "w") as output:
             output.write(self.html.prettify())
         sleep(10)
 
     def load(self) -> None:
-        path = self.path / 'page.html'
+        path = self.path / "page.html"
         if not path.exists():
             self.download()
         else:
-            self.html = BeautifulSoup(path.read_text(), 'html.parser')
+            self.html = BeautifulSoup(path.read_text(), "html.parser")
 
 
 class Book(Item):
@@ -64,6 +65,18 @@ class Book(Item):
             if html.has_attr("onmouseover"):
                 self.parts.append(Part(html.text.strip()))
 
+    def write(self) -> None:
+        index = (
+            f"{self.title}\n{'='*len(self.title)}\n\n"
+            ".. toctree::\n"
+            "   :maxdepth: 2\n"
+            "   :caption: Contents\n\n"
+        )
+        for part in self.parts:
+            index += f"   {part.name}/index\n"
+        with open(self.path / "index.rst", "w") as output:
+            output.write(index)
+
 
 class Part(Item):
     sections: List["Section"] = []
@@ -75,11 +88,13 @@ class Part(Item):
 
     def load(self) -> None:
         super().load()
-        self.sections = [Section(section, self) for section in self.html.find_all("section")]
+        self.sections = [
+            Section(section, self) for section in self.html.find_all("section")
+        ]
 
     def write(self) -> None:
         index = (
-            f".. _{self.name}\n\n"
+            f".. _{self.name}:\n\n"
             f"{self.title}\n{'='*len(self.title)}\n\n"
             ".. toctree::\n"
         )
@@ -93,23 +108,27 @@ class Section(Item):
     chapters: List["Chapter"] = []
 
     def __init__(self, html: Tag, part: Part):
-        self.title = html.div.text
+        self.title = html.div.text.strip()
         self.part = part
         self.path = part.path / self.name
         self.chapters = [Chapter(chapter, self) for chapter in html.find_all("li")]
 
+    def download(self) -> None:
+        pass
+
+    def load(self) -> None:
+        pass
+
     def write(self) -> None:
-        index = f".. _{self.name}\n\n"
+        index = f".. _{self.name}:\n\n"
         index += f"{self.title}\n{'='*len(self.title)}\n\n.. toctree::\n"
         for chapter in self.chapters:
-            index += f"   {chapter.name}/text\n"
+            index += f"   {chapter.name}/text.rst\n"
         with open(self.path / "index.rst", "w") as output:
             output.write(index)
 
 
 class Chapter(Item):
-    headings: List[str] = [r"^\d+\.", r"^\(?[iIvVxX]+\)?\.?", r"^\W \w+"]
-
     def __init__(self, html: Tag, section: Section):
         self.title = html(class_="title")[0].text.strip()
         self.section = section
@@ -118,41 +137,116 @@ class Chapter(Item):
 
     def write(self) -> None:
         if not self.html:
+            self.path.touch()
             return
-        images = 0
-        caption = False
-        text = f"{self.title}\n{'='*len(self.title)}\n\n"
-        for html in self.html.find(class_="old-wrapper").children:
-            if not isinstance(html, Tag):
+
+        items = []
+        for item in self.html.find(class_="old-wrapper").children:
+            if isinstance(item, str):
                 continue
-            elif {"responsive-container", "addtoany_content"} & set(
-                html.attrs.get("class", [])
-            ):
+            if item(class_="addtoany_content"):
                 break
-            elif html.img:
-                images += 1
-                path = self.path / f"{images}.jpg"
-                if not path.exists():
-                    try:
-                        fetch(html.img.attrs["src"], path)
-                    except (DownloadError, KeyError):
-                        continue
-                text += f"\n.. figure:: {images}.jpg\n   :figwidth: 100 %\n\n"
-                caption = True
-            elif html.p or html.em or html.name in ["em", "p"]:
-                html_text = html.text.strip()
-                for heading in self.headings:
-                    if match(heading, html_text) and len(html_text) < 50:
-                        text += f'{html_text}\n{"-"*len(html_text)}\n\n'
-                        break
-                else:
-                    if caption and len(html_text) < 100:
-                        text += "   "
-                    text += html_text + "\n\n"
-                caption = False
+            items.append(item)
+
+        content = []
+        previous = None
+        for i in range(0, len(items) - 1):
+            current = items[i]
+            item = Content(current, previous, items[i + 1])
+            content.append(item)
+            previous = item
+        content.append(Content(items[-1], previous, None))
+        text = f"{self.title}\n{'='*len(self.title)}\n\n"
+        text += "\n".join([c.output() for c in content])
         with open(self.path / "text.rst", "w") as output:
             output.write(text)
         del self.html
+
+
+class Content:
+    headings: List[str] = [r"^\d+\.", r"^\(?[iIvVxX]+\)?\.?", r"^\W \w+"]
+
+    def __init__(self, content: Tag, previous: Optional[Tag], next: Optional[Tag]):
+        self.content = content
+        self.previous = previous
+        self.next = next
+
+    @property
+    def text(self) -> str:
+        if not hasattr(self, "_text"):
+            self._text = self.content.text.strip()
+        return self._text
+
+    @property
+    def img(self) -> str:
+        if not hasattr(self, "_img"):
+            img = self.content.img
+            if img and img.attrs.get("src", "").startswith("http"):
+                self._img = img.attrs["src"]
+            else:
+                self._img = ""
+        return self._img
+
+    @property
+    def is_img(self) -> bool:
+        return self.img != ""
+
+    @property
+    def is_caption(self) -> bool:
+        return bool(
+            self.previous
+            and self.previous.is_img
+            and len(self.text) < 100
+            and not self.is_list
+            and not self.is_heading
+        )
+
+    @property
+    def is_list(self) -> bool:
+        if not self.text.startswith("- "):
+            return False
+        elif self.previous and self.previous.is_list:
+            return True
+        elif self.next and self.next.text.startswith("- "):
+            return True
+        else:
+            return False
+
+    @property
+    def is_heading(self) -> bool:
+        if len(self.text) > 50 or self.is_list:
+            return False
+        for heading in self.headings:
+            if match(heading, self.text):
+                return True
+        return False
+
+    def output(self) -> str:
+        if self.is_img:
+            filename = md5(self.img.encode("utf-8")).hexdigest()
+            path = Book.path / "images" / filename
+            if not path.exists():
+                try:
+                    fetch(self.img, path)
+                except DownloadError:
+                    filename = "404.png"
+            return f".. figure:: ../../../images/{filename}\n   :figwidth: 100 %\n"
+        elif self.is_caption:
+            return f"   {self.text}\n"
+        elif self.is_heading:
+            heading = " ".join(self.text.split()[1:])
+            return f"{heading}\n{'='*len(heading)}\n"
+        elif self.is_list:
+            if self.next and self.next.is_list():
+                return self.text
+        elif self.content.name != "p" and not self.content.p:
+            return ""
+        text = sub("<em>", "<<<", str(self.content))
+        text = sub("</em>", ">>>", text)
+        text = sub(r"\s+<<<\s+", " **", text)
+        text = sub(r"\s+>>>\s+", "** ", text)
+        html = BeautifulSoup(text, "html.parser")
+        return html.text.strip() + "\n"
 
 
 @overload

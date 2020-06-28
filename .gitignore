@@ -4,4 +4,5 @@ __pycache__/
 *.pyc
 source/*
 !source/conf.py
+!source/images/404.png
 build/
