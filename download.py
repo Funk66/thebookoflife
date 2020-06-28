@@ -12,9 +12,14 @@ from alive_progress import alive_bar
 from typing import overload, Optional
 
 
+class DownloadError(Exception):
+    pass
+
+
 class Item:
     title: str
-    name: str
+    path: Path
+    url: str
 
     def __str__(self) -> str:
         return self.title
@@ -22,9 +27,29 @@ class Item:
     def __repr__(self) -> str:
         return self.name
 
-    @staticmethod
-    def sanitize(text: str) -> str:
-        return sub(r"\W", "", text)
+    @property
+    def name(self) -> str:
+        return sub(r"\W", "", self.title)
+
+    def download(self) -> None:
+        if not self.url:
+            return
+        try:
+            self.html = fetch(self.url)
+        except DownloadError:
+            self.html = None
+            return
+        self.path.mkdir(parents=True, exist_ok=True)
+        with open(self.path / 'page.html', 'w') as output:
+            output.write(self.html.prettify())
+        sleep(10)
+
+    def load(self) -> None:
+        path = self.path / 'page.html'
+        if not path.exists():
+            self.download()
+        else:
+            self.html = BeautifulSoup(path.read_text(), 'html.parser')
 
 
 class Book(Item):
@@ -33,32 +58,11 @@ class Book(Item):
     path = Path(__file__).parent / "source"
     parts: List["Part"] = []
 
-    @classmethod
-    def download(cls) -> None:
-        with alive_bar() as bar:
-            for html in fetch(cls.url)(class_="nav-main__sub-rollover"):
-                if html.has_attr("onmouseover"):
-                    cls.parts.append(Part(html.text))
-            for part in cls.parts:
-                bar(part.title)
-                part.download()
-        chapters = [
-            chapter
-            for part in cls.parts
-            for section in part.sections
-            for chapter in section.chapters
-        ]
-        with alive_bar(len(chapters)) as bar:
-            for part in cls.parts:
-                for section in part.sections:
-                    for chapter in section.chapters:
-                        if not (chapter.path / "text.rst").exists():
-                            chapter.download()
-                            chapter.write()
-                            sleep(10)
-                        bar(chapter.title)
-                    section.write()
-                part.write()
+    def load(self) -> None:
+        super().load()
+        for html in self.html(class_="nav-main__sub-rollover"):
+            if html.has_attr("onmouseover"):
+                self.parts.append(Part(html.text.strip()))
 
 
 class Part(Item):
@@ -66,16 +70,12 @@ class Part(Item):
 
     def __init__(self, title: str):
         self.title = title
-        self.name = self.sanitize(title)
         self.url = urljoin(Book.url, f"category/{title.lower()}/?index")
         self.path = Book.path / self.name
 
-    def download(self) -> None:
-        html = fetch(self.url)
-        self.sections = [Section(section, self) for section in html.find_all("section")]
-        for section in self.sections:
-            continue
-            section.download()
+    def load(self) -> None:
+        super().load()
+        self.sections = [Section(section, self) for section in self.html.find_all("section")]
 
     def write(self) -> None:
         index = (
@@ -95,7 +95,6 @@ class Section(Item):
     def __init__(self, html: Tag, part: Part):
         self.title = html.div.text
         self.part = part
-        self.name = self.sanitize(self.title)
         self.path = part.path / self.name
         self.chapters = [Chapter(chapter, self) for chapter in html.find_all("li")]
 
@@ -109,27 +108,20 @@ class Section(Item):
 
 
 class Chapter(Item):
-    headings: List[str] = [r"^\n+\.", r"^\(?[iIvVxX]+\)?\.?"]
+    headings: List[str] = [r"^\d+\.", r"^\(?[iIvVxX]+\)?\.?", r"^\W \w+"]
 
     def __init__(self, html: Tag, section: Section):
-        self.title = html(class_="title")[0].text
-        self.name = self.sanitize(self.title)
+        self.title = html(class_="title")[0].text.strip()
         self.section = section
         self.url = html.a.attrs["href"]
         self.path = section.path / self.name
 
-    def download(self) -> None:
-        try:
-            self.html = fetch(self.url)
-        except HTTPError as error:
-            message = f"{self.url}: {error.code} - {error.reason}"
-            raise HTTPError(self.url, error.code, message, None, None)
-
     def write(self) -> None:
+        if not self.html:
+            return
         images = 0
         caption = False
         text = f"{self.title}\n{'='*len(self.title)}\n\n"
-        self.path.mkdir(parents=True, exist_ok=True)
         for html in self.html.find(class_="old-wrapper").children:
             if not isinstance(html, Tag):
                 continue
@@ -143,23 +135,24 @@ class Chapter(Item):
                 if not path.exists():
                     try:
                         fetch(html.img.attrs["src"], path)
-                    except Exception:
-                        print(f"Failed to fetch image {html.img.attrs.get('src')}")
+                    except (DownloadError, KeyError):
                         continue
                 text += f"\n.. figure:: {images}.jpg\n   :figwidth: 100 %\n\n"
                 caption = True
             elif html.p or html.em or html.name in ["em", "p"]:
+                html_text = html.text.strip()
                 for heading in self.headings:
-                    if match(heading, html.text):
-                        text += html.text + "\n" + "-" * len(html.text)
-                        caption = False
-                        continue
-                if caption and len(html.text) < 100:
-                    text += "   "
-                text += html.text.strip() + "\n\n"
+                    if match(heading, html_text) and len(html_text) < 50:
+                        text += f'{html_text}\n{"-"*len(html_text)}\n\n'
+                        break
+                else:
+                    if caption and len(html_text) < 100:
+                        text += "   "
+                    text += html_text + "\n\n"
                 caption = False
         with open(self.path / "text.rst", "w") as output:
             output.write(text)
+        del self.html
 
 
 @overload
@@ -178,17 +171,49 @@ def fetch(url: str, path: Path = None) -> Optional[BeautifulSoup]:
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/35.0.1916.47 Safari/537.36"
     }
-    if path:
-        response = get(url, headers=headers, stream=True)
-        with open(path, "wb") as output:
-            copyfileobj(response.raw, output)
-        return None
-    else:
-        html = get(url, headers=headers)
-        if html.status_code == 503:
-            raise HTTPError(url, 503, "Rate limited", None, None)
-        return BeautifulSoup(html.text, "html.parser")
+    try:
+        if path:
+            response = get(url, headers=headers, stream=True)
+            response.raise_for_status()
+            with open(path, "wb") as output:
+                copyfileobj(response.raw, output)
+            return None
+        else:
+            html = get(url, headers=headers)
+            html.raise_for_status()
+            if html.status_code == 503:
+                raise HTTPError(url, 503, "Rate limited", None, None)
+            return BeautifulSoup(html.text, "html.parser")
+    except HTTPError as error:
+        print(f"{url} responded with {error.code}: {error.reason}")
+    except Exception as error:
+        print(f"Failed to fetch {url}: {error}")
+    raise DownloadError()
 
 
 if __name__ == "__main__":
-    Book.download()
+    book = Book()
+    with alive_bar():
+        book.load()
+
+    with alive_bar(len(book.parts)) as bar:
+        for part in book.parts:
+            part.load()
+            bar(part.title)
+
+    chapters = [
+        chapter
+        for part in book.parts
+        for section in part.sections
+        for chapter in section.chapters
+    ]
+    with alive_bar(len(chapters)) as bar:
+        for part in book.parts:
+            for section in part.sections:
+                for chapter in section.chapters:
+                    if not (chapter.path / "text.rst").exists():
+                        chapter.load()
+                        chapter.write()
+                    bar(chapter.title)
+                section.write()
+            part.write()
