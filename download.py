@@ -1,4 +1,4 @@
-from re import sub, match
+from re import sub, match, search
 from time import sleep
 from hashlib import md5
 from shutil import copyfileobj
@@ -58,8 +58,8 @@ class Item:
             self.html = BeautifulSoup(path.read_text(), "html.parser")
 
     def write(self) -> None:
-        text = ''
-        if hasattr(self, 'name'):
+        text = ""
+        if hasattr(self, "name"):
             text = f".. _{self.name}:\n\n"
         text += (
             f"{self.title}\n{'='*len(self.title)}\n\n"
@@ -119,10 +119,12 @@ class Chapter(Item):
         self.title = html(class_="title")[0].text.strip()
         self.url = html.a.attrs["href"]
         self.path = parent.path / self.name
+        self.parent = parent
 
     def write(self) -> None:
         if not self.html:
-            self.path.touch()
+            print(f"No content for {self.title}")
+            self.parent.children.pop(self.parent.children.index(self))
             return
 
         items = []
@@ -131,6 +133,8 @@ class Chapter(Item):
                 continue
             if item(class_="addtoany_content"):
                 break
+            if not item.img and not search(r"[a-zA-Z]", item.text):
+                continue
             items.append(item)
 
         content = []
@@ -181,10 +185,11 @@ class Content:
         return bool(
             self.previous
             and self.previous.is_img
+            and not self.previous.text
             and len(self.text) < 100
             and not self.is_list
             and not self.is_heading
-            and match(r'^[a-zA-Z]', self.text)
+            and match(r"^[a-zA-Z]", self.text)
         )
 
     @property
@@ -221,7 +226,10 @@ class Content:
                     fetch(self.img, path)
                 except DownloadError:
                     filename = "404.png"
-            return f".. figure:: ../../../images/{filename}\n   :figwidth: 100 %\n"
+            text = f".. figure:: ../../../images/{filename}\n   :figwidth: 100 %\n"
+            if self.text:
+                text += f"   {self.text}"
+            return text
         elif self.is_caption:
             return f"   {self.text}\n"
         elif self.is_heading:
