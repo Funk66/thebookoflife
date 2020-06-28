@@ -164,7 +164,7 @@ class Chapter(Item):
 
 
 class Content:
-    headings: List[str] = [r"^\d+\.", r"^\(?[iIvVxX]+\)?\.?", r"^\W \w+"]
+    headings: List[str] = [r"^\d+\.", r"^\(?[iIvVxX]+\)?\.?\s", r"^\W[ ]+\w+"]
 
     def __init__(self, content: Tag, previous: Optional[Tag], next: Optional[Tag]):
         self.content = content
@@ -199,6 +199,7 @@ class Content:
             and len(self.text) < 100
             and not self.is_list
             and not self.is_heading
+            and match(r'^\w', self.text)
         )
 
     @property
@@ -214,16 +215,21 @@ class Content:
 
     @property
     def is_heading(self) -> bool:
-        if len(self.text) > 50 or self.is_list:
+        if len(self.text) > 70 or self.is_list:
             return False
         for heading in self.headings:
             if match(heading, self.text):
                 return True
         return False
 
+    def bold(self, tag: str) -> BeautifulSoup:
+        text = sub(f"<{tag}>\\s?", " <<<<<", str(self.content))
+        text = sub(f"\\s?</{tag}>", ">>>>> ", text)
+        return BeautifulSoup(text, "html.parser")
+
     def output(self) -> str:
         if self.is_img:
-            filename = md5(self.img.encode("utf-8")).hexdigest()
+            filename = md5(self.img.encode("utf-8")).hexdigest() + ".jpg"
             path = Book.path / "images" / filename
             if not path.exists():
                 try:
@@ -235,18 +241,23 @@ class Content:
             return f"   {self.text}\n"
         elif self.is_heading:
             heading = " ".join(self.text.split()[1:])
-            return f"{heading}\n{'='*len(heading)}\n"
+            return f"{heading}\n{'-'*len(heading)}\n"
         elif self.is_list:
             if self.next and self.next.is_list():
                 return self.text
         elif self.content.name != "p" and not self.content.p:
             return ""
-        text = sub("<em>", "<<<", str(self.content))
-        text = sub("</em>", ">>>", text)
-        text = sub(r"\s+<<<\s+", " **", text)
-        text = sub(r"\s+>>>\s+", "** ", text)
-        html = BeautifulSoup(text, "html.parser")
-        return html.text.strip() + "\n"
+
+        self.content = BeautifulSoup(sub(r"\s+", " ", str(self.content)), "html.parser")
+        for tag in ["em", "b", "strong"]:
+            for bold in self.content.find_all(tag):
+                if bold.text:
+                    self.content = self.bold(tag)
+            text = sub(r"\s?>>>>>", "**", self.content.text)
+            text = sub(r"<<<<<\s?", "**", text)
+            self._text = text.replace("****", "").strip()
+
+        return self.text + "\n"
 
 
 @overload
@@ -311,3 +322,4 @@ if __name__ == "__main__":
                     bar(chapter.title)
                 section.write()
             part.write()
+        book.write()
