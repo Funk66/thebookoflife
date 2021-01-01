@@ -223,12 +223,13 @@ class Content:
             path = Book.path / "images" / filename
             if not path.exists():
                 try:
-                    fetch(self.img, path)
+                    # fetch(self.img, path)
+                    filename = "404.png"
                 except DownloadError:
                     filename = "404.png"
             text = f".. figure:: ../../../images/{filename}\n   :figwidth: 100 %\n"
             if self.text:
-                text += f"   {self.text}"
+                text += f"\n   {self.text}\n"
             return text
         elif self.is_caption:
             return f"   {self.text}\n"
